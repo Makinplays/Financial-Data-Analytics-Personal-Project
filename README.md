@@ -1,15 +1,16 @@
-# Financial-Data-Analytics-Personal-Project
 import yfinance as yf
 import pandas as pd
 import numpy as np
 from functools import lru_cache
-from scipy.optimize import minimize
+from scipy.optimize import minimize, Bounds, NonlinearConstraint
 import dash
 from dash import dcc, html
 from dash.dependencies import Input, Output, State
 from dash.exceptions import PreventUpdate
 import plotly.graph_objs as go
 import datetime
+import matplotlib.pyplot as plt
+import base64  # Import base64 module for encoding
 
 # Set the current 10-year Treasury rate as the risk-free rate
 risk_free_rate = 0.0461  # As of April 23, 2024
@@ -24,7 +25,7 @@ risk_level_constraints = {
 # External stylesheets for better styling
 external_stylesheets = ['https://codepen.io/chriddyp/pen/bWLwgP.css']
 
-# Initialize Dash app with external stylesheets for better styling
+# Initialize Dash app with external stylesheets
 app = dash.Dash(__name__, external_stylesheets=external_stylesheets)
 
 # Enhanced function to fetch stock data with caching
@@ -36,40 +37,30 @@ def fetch_data(symbols, start_date, end_date):
         data = yf.download(symbol_string, start=start_date, end=end_date)
         if data.empty:
             return pd.DataFrame(), "No data fetched; check the symbols or date range."
-        # Debugging: Print data columns to check structure
-        print(data.columns)
         return data, None
     except Exception as e:
         return pd.DataFrame(), f"Error fetching data: {str(e)}"
-
 
 # Calculate returns from data
 def calculate_returns(data):
     """Calculate and return the percentage returns from adjusted close prices."""
     if data.empty:
         return pd.DataFrame()
-
-    # Check if the DataFrame has a MultiIndex on columns
     if isinstance(data.columns, pd.MultiIndex):
-        # Multi-ticker scenario: use cross-section on 'Adj Close'
         returns = data.xs('Adj Close', level=0, axis=1).pct_change().dropna()
     else:
-        # Single-ticker scenario: directly access 'Adj Close'
-        if 'Adj Close' in data.columns:
-            returns = data['Adj Close'].pct_change().dropna()
-        else:
-            # No 'Adj Close' column found, return empty DataFrame
-            return pd.DataFrame()
-
+        returns = data['Adj Close'].pct_change().dropna() if 'Adj Close' in data.columns else pd.DataFrame()
     return returns
 
-
 # Updated function for diversification analysis
+# Performs diversification analysis on the given returns using the specified weights.
 def diversification_analysis(returns, weights):
-    """Performs diversification analysis on the given returns using the specified weights."""
     try:
         cov_matrix = returns.cov()
-        portfolio_volatility = np.sqrt(np.dot(weights.T, np.dot(cov_matrix, weights.reshape(-1, 1))))
+        # Ensure weights is a proper 1D array
+        weights = np.array(weights).flatten()
+        # Calculate portfolio volatility as a scalar
+        portfolio_volatility = np.sqrt(weights.T @ cov_matrix @ weights)
         individual_volatilities = np.sqrt(np.diag(cov_matrix))
         weighted_sum_volatilities = np.sum(weights * individual_volatilities)
         diversification_ratio = portfolio_volatility / weighted_sum_volatilities
@@ -88,7 +79,7 @@ def diversification_analysis(returns, weights):
                           yaxis_title="Assets")
 
         analysis_results = {
-            'portfolio_volatility': portfolio_volatility,
+            'portfolio_volatility': portfolio_volatility.item(),  # Ensures scalar output
             'diversification_ratio': diversification_ratio,
             'hhi': hhi,
             'effective_number': effective_number,
@@ -98,50 +89,34 @@ def diversification_analysis(returns, weights):
     except Exception as e:
         return {}, f"Error in diversification analysis: {str(e)}"
 
+
 # Function to optimize portfolio using Sharpe ratio
 def optimize_portfolio(returns, risk_free_rate, risk_level='medium'):
     mean_returns = returns.mean()
     cov_matrix = returns.cov()
 
-    print("Cov_matrix null check:", cov_matrix.isnull().any().any())  # Ensure this prints a single boolean
-
-    if mean_returns.isnull().any() or cov_matrix.isnull().any().any():
-        return None, "Invalid return data or insufficient data for covariance calculation."
-
-    # [rest of your code]
-
-    print("Type of mean_returns:", type(mean_returns))
-    print("Type of cov_matrix:", type(cov_matrix))
-    print("Is null in mean_returns:", mean_returns.isnull().any())
-    print("Is null in cov_matrix:", cov_matrix.isnull().any())
-
-    # Check if there are any null values in mean_returns or cov_matrix
-    if mean_returns.isnull().any() or cov_matrix.isnull().any().any():
-        return None, "Invalid return data or insufficient data for covariance calculation."
-
+    # Define the negative Sharpe ratio function
     def negative_sharpe_ratio(weights):
         p_ret = np.dot(weights, mean_returns)
         p_vol = np.sqrt(np.dot(weights.T, np.dot(cov_matrix, weights)))
-        if p_vol == 0:
-            return float('inf')  # Avoid division by zero by returning infinity
-        return -(p_ret - risk_free_rate) / p_vol
+        return -(p_ret - risk_free_rate) / p_vol if p_vol > 0 else float('inf')
 
     num_assets = len(mean_returns)
-    max_weight = risk_level_constraints.get(risk_level, 0.25)
+    bounds = Bounds([0] * num_assets, [1] * num_assets)
     constraints = [
-        {'type': 'eq', 'fun': lambda x: np.sum(x) - 1},
-        {'type': 'ineq', 'fun': lambda x: max_weight - max(x)}
+        {'type': 'eq', 'fun': lambda weights: np.sum(weights) - 1},
+        {'type': 'ineq', 'fun': lambda weights: risk_level_constraints[risk_level] - max(weights)}
     ]
-    bounds = [(0, 1) for _ in range(num_assets)]  # Allowing weights to fully range from 0 to 1
     initial_guess = np.full(num_assets, 1 / num_assets)
-    options = {'disp': True, 'maxiter': 1000}  # Display output and increase max iterations
+    options = {'maxiter': 5000, 'disp': True}
 
-    result = minimize(negative_sharpe_ratio, initial_guess, method='SLSQP', bounds=bounds, constraints=constraints, options=options)
+    result = minimize(negative_sharpe_ratio, initial_guess, method='trust-constr',
+                      bounds=bounds, constraints=constraints, options=options)
+
     if result.success:
         return result.x, None
     else:
         return None, f"Optimization failed: {result.message}"
-
 
 # Define app layout
 app.layout = html.Div([
@@ -214,6 +189,8 @@ def optimize_portfolio_callback(n_clicks, tickers_input, risk_level, start_date,
 
     tickers = tuple(ticker.strip() for ticker in tickers_input.split(','))
     data, error = fetch_data(tickers, start_date, end_date)
+    print("Data:", data)
+    print("Error:", error)
     
     if error:
         return html.Div(f"Error: {error}"), None, None, None
@@ -223,23 +200,42 @@ def optimize_portfolio_callback(n_clicks, tickers_input, risk_level, start_date,
 
     try:
         returns = calculate_returns(data)
+        print("Returns:", returns)
         if returns.empty:
             return html.Div("No returns data available."), None, None, None
     except Exception as e:
         return html.Div(f"Unexpected error while calculating returns: {str(e)}"), None, None, None
 
     optimized_weights, opt_error = optimize_portfolio(returns, risk_free_rate, risk_level)
+    print("Optimized Weights:", optimized_weights)
+    print("Optimization Error:", opt_error)
     if opt_error:
         return html.Div(f"Optimization Error: {opt_error}"), None, None, None
 
     analysis_results, analysis_error = diversification_analysis(returns, optimized_weights)
+    print("Analysis Results:", analysis_results)
+    print("Analysis Error:", analysis_error)
     if analysis_error:
         return html.Div(f"Analysis Error: {analysis_error}"), None, None, None
 
-    portfolio_performance_chart = dcc.Graph(
-        figure=go.Figure(data=[go.Scatter(x=returns.index, y=returns.cumsum(), mode='lines')]),
-        style={'width': '100%', 'height': '400px'}
-    )
+    # Updated portfolio_performance_chart with better date formatting and y-axis as percentage
+    # Plot cumulative returns using Matplotlib
+    plt.figure(figsize=(14, 7))
+    for c in returns.columns.values:
+        plt.plot(returns.index, (1 + returns[c]).cumprod() - 1, lw=3, alpha=0.8, label=c)
+    plt.title('Cumulative Returns Over Time')
+    plt.legend(loc='upper left', fontsize=12)
+    plt.ylabel('Cumulative Returns')
+    plt.xlabel('Date')
+    plt.gcf().autofmt_xdate()  # Rotate dates for better readability
+
+    # Convert the Matplotlib plot to base64
+    plt_base64 = plt_to_base64(plt)
+    plt.close()  # Close the plot to prevent it from displaying in the Dash app
+
+    # Convert the base64 plot to HTML
+    portfolio_performance_chart = html.Div([html.Img(src="data:image/png;base64,{}".format(plt_base64))],
+                                           style={'width': '100%', 'text-align': 'center'})
 
     risk_assessment = html.Div([
         html.H3('Risk Assessment'),
@@ -259,6 +255,14 @@ def optimize_portfolio_callback(n_clicks, tickers_input, risk_level, start_date,
 
     return portfolio_performance_chart, risk_assessment, diversification_contents, evaluation_results
 
+def plt_to_base64(plt):
+    """Convert a Matplotlib plot to base64 encoded image."""
+    import io
+    buf = io.BytesIO()
+    plt.savefig(buf, format='png', bbox_inches='tight')
+    buf.seek(0)
+    plot_base64 = base64.b64encode(buf.read()).decode('utf-8')
+    return plot_base64
 
 if __name__ == '__main__':
     app.run_server(debug=True)
